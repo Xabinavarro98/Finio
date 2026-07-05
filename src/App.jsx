@@ -37,6 +37,13 @@ const eur0 = (n) =>
   (isFinite(n) ? n : 0).toLocaleString("es-ES", { maximumFractionDigits: 0 }) + "€";
 const pct = (n, d = 1) => (isFinite(n) ? n : 0).toLocaleString("es-ES", { minimumFractionDigits: d, maximumFractionDigits: d }) + "%";
 
+// Convierte texto con coma o punto a número. "" o inválido -> 0.
+const numOf = (v) => {
+  if (typeof v === "number") return v;
+  const n = parseFloat(String(v).replace(",", "."));
+  return isFinite(n) ? n : 0;
+};
+
 const META_OBJETIVO_DEFAULT = 1000000;
 
 const FRASES = [
@@ -72,11 +79,16 @@ function reducer(state, action) {
   }
 }
 
-// Rentabilidad efectiva: si el activo tiene ticker, precio de compra y precio actual,
-// se calcula sola (precioActual vs precioCompra). Si no, se usa la rentabilidad manual.
+// Rentabilidad efectiva, con tres modos según los datos del activo:
+//  1) Ticker: si hay ticker + precioCompra + precioActual, compara precios de mercado.
+//  2) Valor actual: si hay valorHoy > 0, compara valorHoy contra invertido (Mintos, cuentas...).
+//  3) Manual: en cualquier otro caso, usa el % que se haya puesto a mano.
 const rentEfectiva = (a) => {
   if (a.ticker && a.precioCompra > 0 && typeof a.precioActual === "number" && a.precioActual > 0) {
     return ((a.precioActual - a.precioCompra) / a.precioCompra) * 100;
+  }
+  if (typeof a.valorHoy === "number" && a.valorHoy > 0 && a.invertido > 0) {
+    return ((a.valorHoy - a.invertido) / a.invertido) * 100;
   }
   return a.rentabilidad || 0;
 };
@@ -143,13 +155,37 @@ export default function App() {
     const rentMediaPond = invertido > 0
       ? assets.reduce((s, a) => s + a.invertido * rentEfectiva(a), 0) / invertido
       : 0;
-    return { invertido, total, beneficio, rentMediaPond };
+
+    // Mejor y peor activo por rentabilidad efectiva
+    let mejor = null, peor = null;
+    assets.forEach((a) => {
+      const r = rentEfectiva(a);
+      if (!mejor || r > mejor.r) mejor = { nombre: a.nombre, r };
+      if (!peor || r < peor.r) peor = { nombre: a.nombre, r };
+    });
+
+    // Exposición a renta variable (por valor actual). Detecta el tipo que contenga "variable".
+    const esRV = (a) => /variable|equity|acci/i.test(a.tipo || "");
+    const valorRV = assets.filter(esRV).reduce((s, a) => s + valorActual(a), 0);
+    const pctRV = total > 0 ? (valorRV / total) * 100 : 0;
+
+    return { invertido, total, beneficio, rentMediaPond, mejor, peor, pctRV };
   }, [assets]);
 
   // ---- Distribución por tipo (sobre valor actual) ----
   const distrib = React.useMemo(() => {
     const by = {};
     assets.forEach((a) => { by[a.tipo] = (by[a.tipo] || 0) + valorActual(a); });
+    const total = Object.values(by).reduce((s, v) => s + v, 0) || 1;
+    return Object.entries(by)
+      .map(([tipo, val], i) => ({ tipo, val, share: (val / total) * 100, color: SLICE[i % SLICE.length] }))
+      .sort((a, b) => b.val - a.val);
+  }, [assets]);
+
+  // ---- Distribución por plataforma (sobre valor actual) ----
+  const distribPlat = React.useMemo(() => {
+    const by = {};
+    assets.forEach((a) => { by[a.plataforma] = (by[a.plataforma] || 0) + valorActual(a); });
     const total = Object.values(by).reduce((s, v) => s + v, 0) || 1;
     return Object.entries(by)
       .map(([tipo, val], i) => ({ tipo, val, share: (val / total) * 100, color: SLICE[i % SLICE.length] }))
@@ -163,7 +199,7 @@ export default function App() {
       <FontLinks />
       <TopBar />
       <main style={{ maxWidth: 1280, margin: "0 auto", padding: "88px 16px 32px" }}>
-        {view === "dashboard" && <Dashboard kpi={kpi} distrib={distrib} progreso={progreso} nPos={assets.length} meta={meta} setMeta={setMeta} onExport={() => exportJSON(assets)} onImport={() => importJSON(dispatch)} onAdd={() => setView("add")} onActualizar={actualizarPrecios} actualizando={actualizando} ultimaActualizacion={ultimaActualizacion} />}
+        {view === "dashboard" && <Dashboard kpi={kpi} distrib={distrib} distribPlat={distribPlat} progreso={progreso} nPos={assets.length} meta={meta} setMeta={setMeta} onExport={() => exportJSON(assets)} onImport={() => importJSON(dispatch)} onAdd={() => setView("add")} onActualizar={actualizarPrecios} actualizando={actualizando} ultimaActualizacion={ultimaActualizacion} />}
         {view === "posiciones" && <Posiciones assets={assets} dispatch={dispatch} onAdd={() => setView("add")} />}
         {view === "add" && <AddAsset tipos={tipos} plataformas={plataformas} onSave={(asset) => { dispatch({ type: "add", asset }); setView("posiciones"); }} onCancel={() => setView("posiciones")} />}
       </main>
@@ -201,7 +237,7 @@ function TopBar() {
 // ============================================================
 //  DASHBOARD
 // ============================================================
-function Dashboard({ kpi, distrib, progreso, nPos, meta, setMeta, onExport, onImport, onAdd, onActualizar, actualizando, ultimaActualizacion }) {
+function Dashboard({ kpi, distrib, distribPlat, progreso, nPos, meta, setMeta, onExport, onImport, onAdd, onActualizar, actualizando, ultimaActualizacion }) {
   const positivo = kpi.beneficio >= 0;
   const vacio = nPos === 0;
   return (
@@ -241,19 +277,48 @@ function Dashboard({ kpi, distrib, progreso, nPos, meta, setMeta, onExport, onIm
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 16 }}>
         <Kpi label="Invertido" icon="account_balance_wallet" value={eur0(kpi.invertido)} sub="Capital aportado" />
         <Kpi label="Beneficio" icon={positivo ? "trending_up" : "trending_down"} value={(positivo ? "+" : "") + eur0(kpi.beneficio)} sub="Latente" color={positivo ? C.green : C.red} />
-        <Kpi label="Rent. media ponderada" icon="query_stats" value={pct(kpi.rentMediaPond, 2)} sub="Σ(inv×rent)/Σinv" color={kpi.rentMediaPond >= 0 ? C.green : C.red} />
+        <Kpi label="Rent. media ponderada" icon="query_stats" value={pct(kpi.rentMediaPond, 2)} sub="" color={kpi.rentMediaPond >= 0 ? C.green : C.red} />
         <Kpi label="Nº posiciones" icon="stacks" value={String(nPos)} sub="Activos abiertos" />
       </div>
 
+      {/* KPIs adicionales */}
+      {nPos > 0 && (
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 16 }}>
+          <Kpi label="Mejor activo" icon="trophy" value={kpi.mejor ? pct(kpi.mejor.r, 2) : "—"} sub={kpi.mejor ? kpi.mejor.nombre : ""} color={C.green} />
+          <Kpi label="Peor activo" icon="trending_down" value={kpi.peor ? pct(kpi.peor.r, 2) : "—"} sub={kpi.peor ? kpi.peor.nombre : ""} color={kpi.peor && kpi.peor.r < 0 ? C.red : C.dim} />
+          <Kpi label="Exposición renta variable" icon="show_chart" value={pct(kpi.pctRV)} sub="del patrimonio total" color={C.blue} />
+        </div>
+      )}
+
       {/* Distribución + Objetivo */}
       <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 24 }}>
-        <div style={{ ...panelStyle, padding: 24 }}>
-          <h3 style={{ fontSize: 20, fontWeight: 600, color: C.gold, margin: "0 0 24px", borderBottom: `1px solid ${C.lineSoft}`, paddingBottom: 16 }}>Distribución</h3>
-          <Donut distrib={distrib} />
-        </div>
+        <DistribucionPanel distrib={distrib} distribPlat={distribPlat} />
 
         <ObjetivoPanel kpi={kpi} progreso={progreso} meta={meta} setMeta={setMeta} />
       </div>
+    </div>
+  );
+}
+
+// ---- Panel de distribución con toggle tipo/plataforma ----
+function DistribucionPanel({ distrib, distribPlat }) {
+  const [modo, setModo] = React.useState("tipo");
+  const datos = modo === "tipo" ? distrib : distribPlat;
+  return (
+    <div style={{ ...panelStyle, padding: 24 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", margin: "0 0 24px", borderBottom: `1px solid ${C.lineSoft}`, paddingBottom: 16 }}>
+        <h3 style={{ fontSize: 20, fontWeight: 600, color: C.gold, margin: 0 }}>Distribución</h3>
+        <div style={{ display: "flex", background: C.panelLow, padding: 4, borderRadius: 8, border: `1px solid ${C.lineSoft}` }}>
+          {["tipo", "plataforma"].map((m) => (
+            <button key={m} onClick={() => setModo(m)}
+              style={{ padding: "5px 14px", borderRadius: 6, fontSize: 13, fontWeight: 600, border: "none", cursor: "pointer", textTransform: "capitalize",
+                background: modo === m ? C.gold : "transparent", color: modo === m ? "#fff" : C.dim }}>
+              {m}
+            </button>
+          ))}
+        </div>
+      </div>
+      <Donut distrib={datos} />
     </div>
   );
 }
@@ -325,34 +390,51 @@ function Kpi({ label, icon, value, sub, color, hideRaw }) {
 // ---- Donut SVG dinámico ----
 function Donut({ distrib }) {
   const R = 15.9155, CIRC = 2 * Math.PI * R;
+  const [hover, setHover] = React.useState(null); // índice del segmento resaltado
   let offset = 0;
+  const activo = hover != null ? distrib[hover] : null;
   return (
     <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 24 }}>
       <div style={{ position: "relative", width: 192, height: 192 }}>
         <svg viewBox="0 0 36 36" style={{ width: "100%", height: "100%", transform: "rotate(-90deg)" }}>
           {distrib.map((d, i) => {
             const len = (d.share / 100) * CIRC;
+            const atenuado = hover != null && hover !== i;
             const seg = (
-              <circle key={i} cx="18" cy="18" r={R} fill="none" stroke={d.color} strokeWidth="4"
-                strokeDasharray={`${len} ${CIRC - len}`} strokeDashoffset={-offset} />
+              <circle key={i} cx="18" cy="18" r={R} fill="none" stroke={d.color}
+                strokeWidth={hover === i ? 5 : 4}
+                strokeDasharray={`${len} ${CIRC - len}`} strokeDashoffset={-offset}
+                style={{ opacity: atenuado ? 0.35 : 1, transition: "opacity .15s, stroke-width .15s", cursor: "pointer" }}
+                onMouseEnter={() => setHover(i)} onMouseLeave={() => setHover(null)} />
             );
             offset += len;
             return seg;
           })}
         </svg>
-        <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center" }}>
-          <span style={{ ...mono, fontSize: 16 }}>{distrib.length} tipos</span>
-          <span style={{ ...mono, fontSize: 24, color: C.gold }}>100%</span>
+        <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", pointerEvents: "none", padding: 24, textAlign: "center" }}>
+          {activo ? (
+            <>
+              <span style={{ ...mono, fontSize: 13, color: C.ink }}>{activo.tipo}</span>
+              <span style={{ ...mono, fontSize: 20, color: C.gold }}>{pct(activo.share)}</span>
+              <span style={{ ...mono, fontSize: 11, color: C.faint }}>{eur0(activo.val)}</span>
+            </>
+          ) : (
+            <>
+              <span style={{ ...mono, fontSize: 16 }}>{distrib.length} {distrib.length === 1 ? "tipo" : "tipos"}</span>
+              <span style={{ ...mono, fontSize: 24, color: C.gold }}>100%</span>
+            </>
+          )}
         </div>
       </div>
       <div style={{ width: "100%", display: "flex", flexDirection: "column", gap: 10 }}>
         {distrib.map((d, i) => (
-          <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div key={i} onMouseEnter={() => setHover(i)} onMouseLeave={() => setHover(null)}
+            style={{ display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer", opacity: hover != null && hover !== i ? 0.5 : 1, transition: "opacity .15s" }}>
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
               <span style={{ width: 12, height: 12, borderRadius: 999, background: d.color, flexShrink: 0 }} />
               <span style={{ color: C.ink }}>{d.tipo}</span>
             </div>
-            <span style={{ ...mono, fontSize: 14 }}>{pct(d.share)}</span>
+            <span style={{ ...mono, fontSize: 14 }}>{pct(d.share)} · {eur0(d.val)}</span>
           </div>
         ))}
       </div>
@@ -388,7 +470,7 @@ function Posiciones({ assets, dispatch, onAdd }) {
       <div style={{ position: "relative" }}>
         <Icon name="search" size={20} style={{ position: "absolute", left: 16, top: "50%", transform: "translateY(-50%)", color: C.faint }} />
         <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Buscar activo, plataforma…"
-          style={{ width: "100%", background: C.bg, border: `1px solid ${C.line}`, borderRadius: 8, padding: "12px 16px 12px 48px", color: C.ink, ...mono, fontSize: 16 }} />
+          style={{ width: "100%", background: C.bg, border: `1px solid ${C.line}`, borderRadius: 8, padding: "12px 16px 12px 48px", color: C.ink, fontFamily: "'Hanken Grotesk', sans-serif", fontSize: 16 }} />
       </div>
 
       {/* Agrupar por */}
@@ -398,7 +480,7 @@ function Posiciones({ assets, dispatch, onAdd }) {
           {["tipo", "plataforma"].map((g) => (
             <button key={g} onClick={() => setGroup(g)}
               style={{ padding: "6px 16px", borderRadius: 6, fontSize: 14, fontWeight: 500, border: "none", cursor: "pointer", textTransform: "capitalize",
-                background: group === g ? C.gold : "transparent", color: group === g ? "#412d00" : C.dim }}>
+                background: group === g ? C.gold : "transparent", color: group === g ? "#fff" : C.dim }}>
               {g}
             </button>
           ))}
@@ -450,7 +532,7 @@ function AssetCard({ a, dispatch }) {
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
         <div style={{ display: "flex", flexDirection: "column", minWidth: 0 }}>
           <span style={{ fontWeight: 600, color: C.ink, overflow: "hidden", textOverflow: "ellipsis" }}>{a.nombre}{a.esTactico && <span style={{ ...capsLabel, color: C.blue, marginLeft: 8 }}>táctico</span>}</span>
-          <span style={{ fontSize: 12, color: C.dim, ...mono }}>{a.plataforma} · {a.tipo}{a.ticker ? ` · ${a.ticker}` : ""}</span>
+          <span style={{ fontSize: 12, color: C.dim }}>{a.plataforma} · {a.tipo}{a.ticker ? <span style={mono}> · {a.ticker}</span> : ""}</span>
         </div>
         <div style={{ textAlign: "right", display: "flex", flexDirection: "column", flexShrink: 0 }}>
           <span style={{ ...mono, fontSize: 20, fontWeight: 600 }}>{eur(va)}</span>
@@ -477,8 +559,8 @@ function AssetCard({ a, dispatch }) {
       {edit && (
         <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 8 }}>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
-            <MiniField label="Invertido (€)" value={a.invertido} onChange={(v) => dispatch({ type: "update", id: a.id, patch: { invertido: parseFloat(v) || 0 } })} />
-            <MiniField label="Rentabilidad (%)" value={a.rentabilidad} onChange={(v) => dispatch({ type: "update", id: a.id, patch: { rentabilidad: parseFloat(v) || 0 } })} />
+            <MiniField label="Invertido (€)" value={a.invertido} onChange={(v) => dispatch({ type: "update", id: a.id, patch: { invertido: v } })} />
+            <MiniField label="Rentabilidad (%)" value={a.rentabilidad} onChange={(v) => dispatch({ type: "update", id: a.id, patch: { rentabilidad: v } })} />
           </div>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
             <label style={{ display: "block" }}>
@@ -486,8 +568,15 @@ function AssetCard({ a, dispatch }) {
               <input value={a.ticker || ""} onChange={(e) => dispatch({ type: "update", id: a.id, patch: { ticker: e.target.value.toUpperCase() } })}
                 placeholder="Ej: IWDA.L" style={{ width: "100%", background: C.bg, border: `1px solid ${C.line}`, borderRadius: 6, padding: 8, color: C.ink, ...mono }} />
             </label>
-            <MiniField label="Precio compra" value={a.precioCompra || 0} onChange={(v) => dispatch({ type: "update", id: a.id, patch: { precioCompra: parseFloat(v) || 0 } })} />
+            <MiniField label="Precio compra" value={a.precioCompra || 0} onChange={(v) => dispatch({ type: "update", id: a.id, patch: { precioCompra: v } })} />
           </div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+            <MiniField label="Valor hoy (€)" value={a.valorHoy || 0} onChange={(v) => dispatch({ type: "update", id: a.id, patch: { valorHoy: v } })} />
+            <div />
+          </div>
+          <p style={{ margin: 0, fontSize: 11, color: C.faint }}>
+            “Valor hoy” es para Mintos, cuentas remuneradas, etc.: pon lo que tienes ahora mismo y la rentabilidad sale sola (sin ticker).
+          </p>
           {autoTicker && (
             <p style={{ margin: 0, fontSize: 11, color: C.faint }}>
               Con ticker y precio de compra, la rentabilidad se calcula sola al actualizar precios (ignora el campo manual de arriba).
@@ -501,11 +590,28 @@ function AssetCard({ a, dispatch }) {
 
 const miniBtn = { flex: 1, padding: "6px 10px", fontSize: 12, background: C.panelHigh, border: `1px solid ${C.line}`, borderRadius: 6, color: C.dim, cursor: "pointer", fontFamily: "'Hanken Grotesk', sans-serif" };
 
+// Input numérico robusto: guarda el texto mientras escribes (permite ".", "," y vacío),
+// y solo emite el número al padre cuando cambia. Evita el "0" fantasma y el borrado al teclear ".".
 function MiniField({ label, value, onChange }) {
+  const [txt, setTxt] = React.useState(value === 0 || value == null ? "" : String(value));
+  React.useEffect(() => {
+    // Sincroniza si el valor externo cambia (ej: actualización de precios) y no coincide.
+    const externo = value === 0 || value == null ? "" : String(value);
+    if (numOf(txt) !== numOf(externo)) setTxt(externo);
+    // eslint-disable-next-line
+  }, [value]);
+  const handle = (e) => {
+    let v = e.target.value;
+    // Permite dígitos, un separador decimal (coma o punto) y signo negativo.
+    if (/^-?\d*[.,]?\d*$/.test(v) || v === "") {
+      setTxt(v);
+      onChange(numOf(v));
+    }
+  };
   return (
     <label style={{ display: "block" }}>
       <span style={{ ...capsLabel, display: "block", marginBottom: 4 }}>{label}</span>
-      <input type="number" value={value} onChange={(e) => onChange(e.target.value)}
+      <input type="text" inputMode="decimal" value={txt} onChange={handle}
         style={{ width: "100%", background: C.bg, border: `1px solid ${C.line}`, borderRadius: 6, padding: 8, color: C.ink, ...mono }} />
     </label>
   );
@@ -515,10 +621,14 @@ function MiniField({ label, value, onChange }) {
 //  AÑADIR ACTIVO
 // ============================================================
 function AddAsset({ tipos, plataformas, onSave, onCancel }) {
-  const [f, setF] = React.useState({ nombre: "", tipo: tipos[0] || "", plataforma: plataformas[0] || "", invertido: "", rentabilidad: "", ticker: "", precioCompra: "", fechaEntrada: "", esTactico: false, faseSoros: "", notas: "" });
+  const [f, setF] = React.useState({ nombre: "", tipo: tipos[0] || "", plataforma: plataformas[0] || "", invertido: "", rentabilidad: "", ticker: "", precioCompra: "", valorHoy: "", fechaEntrada: "", esTactico: false, faseSoros: "", notas: "" });
   const [nuevoTipo, setNuevoTipo] = React.useState(false);
   const [nuevaPlat, setNuevaPlat] = React.useState(false);
   const set = (k, v) => setF((o) => ({ ...o, [k]: v }));
+  // Para campos numéricos: acepta dígitos, coma o punto, y vacío. Guarda el texto tal cual.
+  const setNum = (k, v) => {
+    if (/^-?\d*[.,]?\d*$/.test(v) || v === "") setF((o) => ({ ...o, [k]: v }));
+  };
 
   const valido = f.nombre.trim() && f.tipo.trim() && f.invertido !== "";
 
@@ -528,11 +638,12 @@ function AddAsset({ tipos, plataformas, onSave, onCancel }) {
       nombre: f.nombre.trim(),
       tipo: f.tipo.trim(),
       plataforma: f.plataforma.trim() || "-",
-      invertido: parseFloat(f.invertido) || 0,
-      rentabilidad: parseFloat(f.rentabilidad) || 0,
+      invertido: numOf(f.invertido),
+      rentabilidad: numOf(f.rentabilidad),
       ticker: f.ticker.trim(),
-      precioCompra: parseFloat(f.precioCompra) || 0,
+      precioCompra: numOf(f.precioCompra),
       precioActual: null,
+      valorHoy: numOf(f.valorHoy),
       fechaEntrada: f.fechaEntrada,
       esTactico: f.esTactico,
       faseSoros: f.faseSoros,
@@ -583,34 +694,48 @@ function AddAsset({ tipos, plataformas, onSave, onCancel }) {
         <Section icon="payments" title="Datos financieros">
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
             <Field label="Importe invertido (€)">
-              <input type="number" value={f.invertido} onChange={(e) => set("invertido", e.target.value)} placeholder="0.00" style={{ ...inp, ...mono }} />
+              <input type="text" inputMode="decimal" value={f.invertido} onChange={(e) => setNum("invertido", e.target.value)} placeholder="0,00" style={{ ...inp, ...mono }} />
             </Field>
-            <Field label="Rentabilidad (%)">
-              <input type="number" value={f.rentabilidad} onChange={(e) => set("rentabilidad", e.target.value)} placeholder="Ej: 10.7" style={{ ...inp, ...mono, opacity: f.ticker.trim() ? 0.5 : 1 }} disabled={!!f.ticker.trim()} />
+            <Field label="Rentabilidad (%) — manual">
+              <input type="text" inputMode="decimal" value={f.rentabilidad} onChange={(e) => setNum("rentabilidad", e.target.value)} placeholder="Ej: 10,7" style={{ ...inp, ...mono, opacity: (f.ticker.trim() || f.valorHoy) ? 0.5 : 1 }} disabled={!!(f.ticker.trim() || f.valorHoy)} />
             </Field>
           </div>
           {f.invertido !== "" && (
             <div style={{ ...capsLabel, color: C.faint, marginTop: 4 }}>
-              Valor actual estimado: {eur((parseFloat(f.invertido) || 0) * (1 + (parseFloat(f.rentabilidad) || 0) / 100))}
+              Valor actual estimado: {eur(numOf(f.invertido) * (1 + numOf(f.rentabilidad) / 100))}
             </div>
           )}
+
+          {/* Modo valor actual (Mintos, cuentas remuneradas...) */}
+          <div style={{ marginTop: 8, padding: 14, background: C.panelLow, border: `1px dashed ${C.line}`, borderRadius: 8 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 10 }}>
+              <Icon name="savings" size={16} style={{ color: C.gold }} />
+              <span style={{ ...capsLabel, color: C.gold }}>Seguimiento por valor actual (opcional)</span>
+            </div>
+            <Field label="Valor hoy (€)">
+              <input type="text" inputMode="decimal" value={f.valorHoy} onChange={(e) => setNum("valorHoy", e.target.value)} placeholder="Lo que tienes ahora mismo" style={{ ...inp, ...mono }} />
+            </Field>
+            <p style={{ margin: "8px 0 0", fontSize: 12, color: C.faint }}>
+              Para Mintos, cuentas remuneradas, etc.: pon lo invertido arriba y aquí lo que tienes hoy. La rentabilidad se calcula sola.
+            </p>
+          </div>
 
           {/* Seguimiento automático por ticker (opcional) */}
           <div style={{ marginTop: 8, padding: 14, background: C.panelLow, border: `1px dashed ${C.line}`, borderRadius: 8 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 10 }}>
               <Icon name="sync" size={16} style={{ color: C.gold }} />
-              <span style={{ ...capsLabel, color: C.gold }}>Seguimiento automático (opcional)</span>
+              <span style={{ ...capsLabel, color: C.gold }}>Seguimiento automático por ticker (opcional)</span>
             </div>
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
               <Field label="Ticker (Yahoo Finance)">
-                <input value={f.ticker} onChange={(e) => set("ticker", e.target.value.toUpperCase())} placeholder="Ej: AAPL, IWDA.L, SAN.MC" style={{ ...inp, ...mono }} />
+                <input value={f.ticker} onChange={(e) => set("ticker", e.target.value.toUpperCase())} placeholder="Ej: AAPL, IE00BYX5NX33.SG" style={{ ...inp, ...mono }} />
               </Field>
               <Field label="Precio de compra">
-                <input type="number" value={f.precioCompra} onChange={(e) => set("precioCompra", e.target.value)} placeholder="0.00" style={{ ...inp, ...mono }} />
+                <input type="text" inputMode="decimal" value={f.precioCompra} onChange={(e) => setNum("precioCompra", e.target.value)} placeholder="0,00" style={{ ...inp, ...mono }} />
               </Field>
             </div>
             <p style={{ margin: "8px 0 0", fontSize: 12, color: C.faint }}>
-              Si rellenas ticker y precio de compra, la rentabilidad se calculará sola al pulsar “Actualizar precios”. Si lo dejas vacío, se usa la rentabilidad que pongas a mano.
+              Si rellenas ticker y precio de compra, la rentabilidad se calcula sola al pulsar “Actualizar precios”.
             </p>
           </div>
 
