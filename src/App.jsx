@@ -72,7 +72,16 @@ function reducer(state, action) {
   }
 }
 
-const valorActual = (a) => a.invertido * (1 + a.rentabilidad / 100);
+// Rentabilidad efectiva: si el activo tiene ticker, precio de compra y precio actual,
+// se calcula sola (precioActual vs precioCompra). Si no, se usa la rentabilidad manual.
+const rentEfectiva = (a) => {
+  if (a.ticker && a.precioCompra > 0 && typeof a.precioActual === "number" && a.precioActual > 0) {
+    return ((a.precioActual - a.precioCompra) / a.precioCompra) * 100;
+  }
+  return a.rentabilidad || 0;
+};
+
+const valorActual = (a) => a.invertido * (1 + rentEfectiva(a) / 100);
 
 // ---- Iconos mínimos (Material Symbols vía font si está; fallback texto) ----
 const Icon = ({ name, style, size = 20 }) => (
@@ -87,6 +96,39 @@ export default function App() {
   const [view, setView] = React.useState("dashboard"); // dashboard | posiciones | add
   const [meta, setMeta] = React.useState(loadMeta);
   React.useEffect(() => { try { localStorage.setItem(META_KEY, String(meta)); } catch (e) {} }, [meta]);
+
+  const [actualizando, setActualizando] = React.useState(false);
+  const [ultimaActualizacion, setUltimaActualizacion] = React.useState(null);
+
+  // Recorre los activos con ticker y actualiza su precioActual desde /api/quote.
+  const actualizarPrecios = async () => {
+    const conTicker = assets.filter((a) => a.ticker && a.ticker.trim());
+    if (conTicker.length === 0) {
+      alert("Ningún activo tiene ticker. Edita un activo y añade su ticker de Yahoo (ej: AAPL, IWDA.L, EUNL.DE).");
+      return;
+    }
+    setActualizando(true);
+    let ok = 0, fallos = [];
+    for (const a of conTicker) {
+      try {
+        const r = await fetch(`/api/quote?ticker=${encodeURIComponent(a.ticker.trim())}`);
+        const data = await r.json();
+        if (data && typeof data.precio === "number") {
+          dispatch({ type: "update", id: a.id, patch: { precioActual: data.precio, tickerNombre: data.nombre, tickerMoneda: data.moneda } });
+          ok++;
+        } else {
+          fallos.push(a.ticker);
+        }
+      } catch (e) {
+        fallos.push(a.ticker);
+      }
+    }
+    setActualizando(false);
+    setUltimaActualizacion(new Date());
+    if (fallos.length > 0) {
+      alert(`Actualizados ${ok}. No se encontraron: ${fallos.join(", ")}. Revisa que el ticker sea el de Yahoo Finance.`);
+    }
+  };
   React.useEffect(() => { try { localStorage.setItem(STORE_KEY, JSON.stringify(assets)); } catch (e) {} }, [assets]);
 
   // Tipos y plataformas crecen solos
@@ -99,7 +141,7 @@ export default function App() {
     const total = assets.reduce((s, a) => s + valorActual(a), 0);
     const beneficio = total - invertido;
     const rentMediaPond = invertido > 0
-      ? assets.reduce((s, a) => s + a.invertido * a.rentabilidad, 0) / invertido
+      ? assets.reduce((s, a) => s + a.invertido * rentEfectiva(a), 0) / invertido
       : 0;
     return { invertido, total, beneficio, rentMediaPond };
   }, [assets]);
@@ -121,7 +163,7 @@ export default function App() {
       <FontLinks />
       <TopBar />
       <main style={{ maxWidth: 1280, margin: "0 auto", padding: "88px 16px 32px" }}>
-        {view === "dashboard" && <Dashboard kpi={kpi} distrib={distrib} progreso={progreso} nPos={assets.length} meta={meta} setMeta={setMeta} onExport={() => exportJSON(assets)} onImport={() => importJSON(dispatch)} onAdd={() => setView("add")} />}
+        {view === "dashboard" && <Dashboard kpi={kpi} distrib={distrib} progreso={progreso} nPos={assets.length} meta={meta} setMeta={setMeta} onExport={() => exportJSON(assets)} onImport={() => importJSON(dispatch)} onAdd={() => setView("add")} onActualizar={actualizarPrecios} actualizando={actualizando} ultimaActualizacion={ultimaActualizacion} />}
         {view === "posiciones" && <Posiciones assets={assets} dispatch={dispatch} onAdd={() => setView("add")} />}
         {view === "add" && <AddAsset tipos={tipos} plataformas={plataformas} onSave={(asset) => { dispatch({ type: "add", asset }); setView("posiciones"); }} onCancel={() => setView("posiciones")} />}
       </main>
@@ -159,7 +201,7 @@ function TopBar() {
 // ============================================================
 //  DASHBOARD
 // ============================================================
-function Dashboard({ kpi, distrib, progreso, nPos, meta, setMeta, onExport, onImport, onAdd }) {
+function Dashboard({ kpi, distrib, progreso, nPos, meta, setMeta, onExport, onImport, onAdd, onActualizar, actualizando, ultimaActualizacion }) {
   const positivo = kpi.beneficio >= 0;
   const vacio = nPos === 0;
   return (
@@ -188,6 +230,7 @@ function Dashboard({ kpi, distrib, progreso, nPos, meta, setMeta, onExport, onIm
           </div>
         </div>
         <div style={{ display: "flex", gap: 8 }}>
+          <BtnGhost icon={actualizando ? "hourglass_empty" : "refresh"} onClick={actualizando ? undefined : onActualizar}>{actualizando ? "Actualizando…" : "Actualizar precios"}</BtnGhost>
           <BtnGhost icon="upload" onClick={onImport}>Importar</BtnGhost>
           <BtnGhost icon="download" onClick={onExport}>Exportar</BtnGhost>
           <BtnGold icon="add" onClick={onAdd}>Nuevo activo</BtnGold>
@@ -399,22 +442,32 @@ function Posiciones({ assets, dispatch, onAdd }) {
 function AssetCard({ a, dispatch }) {
   const [edit, setEdit] = React.useState(false);
   const va = valorActual(a);
-  const positivo = a.rentabilidad >= 0;
+  const rent = rentEfectiva(a);
+  const positivo = rent >= 0;
+  const autoTicker = a.ticker && a.precioCompra > 0;
   return (
     <div style={{ ...panelStyle, padding: 16 }}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
         <div style={{ display: "flex", flexDirection: "column", minWidth: 0 }}>
           <span style={{ fontWeight: 600, color: C.ink, overflow: "hidden", textOverflow: "ellipsis" }}>{a.nombre}{a.esTactico && <span style={{ ...capsLabel, color: C.blue, marginLeft: 8 }}>táctico</span>}</span>
-          <span style={{ fontSize: 12, color: C.dim, ...mono }}>{a.plataforma} · {a.tipo}</span>
+          <span style={{ fontSize: 12, color: C.dim, ...mono }}>{a.plataforma} · {a.tipo}{a.ticker ? ` · ${a.ticker}` : ""}</span>
         </div>
         <div style={{ textAlign: "right", display: "flex", flexDirection: "column", flexShrink: 0 }}>
           <span style={{ ...mono, fontSize: 20, fontWeight: 600 }}>{eur(va)}</span>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 6 }}>
             <span style={{ ...mono, fontSize: 12, color: positivo ? C.green : C.red, display: "flex", alignItems: "center" }}>
-              {pct(a.rentabilidad, 2)} <Icon name={positivo ? "arrow_upward" : "arrow_downward"} size={14} />
+              {pct(rent, 2)} <Icon name={positivo ? "arrow_upward" : "arrow_downward"} size={14} />
             </span>
             <span style={{ ...mono, fontSize: 10, color: C.faint }}>inv {eur0(a.invertido)}</span>
           </div>
+          {autoTicker && typeof a.precioActual === "number" && (
+            <span style={{ ...mono, fontSize: 10, color: C.gold, marginTop: 2 }}>
+              {a.precioActual.toFixed(2)}{a.tickerMoneda ? " " + a.tickerMoneda : ""} · compra {a.precioCompra}
+            </span>
+          )}
+          {autoTicker && typeof a.precioActual !== "number" && (
+            <span style={{ ...mono, fontSize: 10, color: C.faint, marginTop: 2 }}>sin actualizar</span>
+          )}
         </div>
       </div>
       <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
@@ -422,9 +475,24 @@ function AssetCard({ a, dispatch }) {
         <button onClick={() => dispatch({ type: "remove", id: a.id })} style={{ ...miniBtn, color: C.red, borderColor: "rgba(255,180,171,.3)" }}>Eliminar</button>
       </div>
       {edit && (
-        <div style={{ marginTop: 12, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
-          <MiniField label="Invertido (€)" value={a.invertido} onChange={(v) => dispatch({ type: "update", id: a.id, patch: { invertido: parseFloat(v) || 0 } })} />
-          <MiniField label="Rentabilidad (%)" value={a.rentabilidad} onChange={(v) => dispatch({ type: "update", id: a.id, patch: { rentabilidad: parseFloat(v) || 0 } })} />
+        <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 8 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+            <MiniField label="Invertido (€)" value={a.invertido} onChange={(v) => dispatch({ type: "update", id: a.id, patch: { invertido: parseFloat(v) || 0 } })} />
+            <MiniField label="Rentabilidad (%)" value={a.rentabilidad} onChange={(v) => dispatch({ type: "update", id: a.id, patch: { rentabilidad: parseFloat(v) || 0 } })} />
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+            <label style={{ display: "block" }}>
+              <span style={{ ...capsLabel, display: "block", marginBottom: 4 }}>Ticker (Yahoo)</span>
+              <input value={a.ticker || ""} onChange={(e) => dispatch({ type: "update", id: a.id, patch: { ticker: e.target.value.toUpperCase() } })}
+                placeholder="Ej: IWDA.L" style={{ width: "100%", background: C.bg, border: `1px solid ${C.line}`, borderRadius: 6, padding: 8, color: C.ink, ...mono }} />
+            </label>
+            <MiniField label="Precio compra" value={a.precioCompra || 0} onChange={(v) => dispatch({ type: "update", id: a.id, patch: { precioCompra: parseFloat(v) || 0 } })} />
+          </div>
+          {autoTicker && (
+            <p style={{ margin: 0, fontSize: 11, color: C.faint }}>
+              Con ticker y precio de compra, la rentabilidad se calcula sola al actualizar precios (ignora el campo manual de arriba).
+            </p>
+          )}
         </div>
       )}
     </div>
@@ -447,7 +515,7 @@ function MiniField({ label, value, onChange }) {
 //  AÑADIR ACTIVO
 // ============================================================
 function AddAsset({ tipos, plataformas, onSave, onCancel }) {
-  const [f, setF] = React.useState({ nombre: "", tipo: tipos[0] || "", plataforma: plataformas[0] || "", invertido: "", rentabilidad: "", fechaEntrada: "", esTactico: false, faseSoros: "", notas: "" });
+  const [f, setF] = React.useState({ nombre: "", tipo: tipos[0] || "", plataforma: plataformas[0] || "", invertido: "", rentabilidad: "", ticker: "", precioCompra: "", fechaEntrada: "", esTactico: false, faseSoros: "", notas: "" });
   const [nuevoTipo, setNuevoTipo] = React.useState(false);
   const [nuevaPlat, setNuevaPlat] = React.useState(false);
   const set = (k, v) => setF((o) => ({ ...o, [k]: v }));
@@ -462,6 +530,9 @@ function AddAsset({ tipos, plataformas, onSave, onCancel }) {
       plataforma: f.plataforma.trim() || "-",
       invertido: parseFloat(f.invertido) || 0,
       rentabilidad: parseFloat(f.rentabilidad) || 0,
+      ticker: f.ticker.trim(),
+      precioCompra: parseFloat(f.precioCompra) || 0,
+      precioActual: null,
       fechaEntrada: f.fechaEntrada,
       esTactico: f.esTactico,
       faseSoros: f.faseSoros,
@@ -515,7 +586,7 @@ function AddAsset({ tipos, plataformas, onSave, onCancel }) {
               <input type="number" value={f.invertido} onChange={(e) => set("invertido", e.target.value)} placeholder="0.00" style={{ ...inp, ...mono }} />
             </Field>
             <Field label="Rentabilidad (%)">
-              <input type="number" value={f.rentabilidad} onChange={(e) => set("rentabilidad", e.target.value)} placeholder="Ej: 10.7" style={{ ...inp, ...mono }} />
+              <input type="number" value={f.rentabilidad} onChange={(e) => set("rentabilidad", e.target.value)} placeholder="Ej: 10.7" style={{ ...inp, ...mono, opacity: f.ticker.trim() ? 0.5 : 1 }} disabled={!!f.ticker.trim()} />
             </Field>
           </div>
           {f.invertido !== "" && (
@@ -523,6 +594,26 @@ function AddAsset({ tipos, plataformas, onSave, onCancel }) {
               Valor actual estimado: {eur((parseFloat(f.invertido) || 0) * (1 + (parseFloat(f.rentabilidad) || 0) / 100))}
             </div>
           )}
+
+          {/* Seguimiento automático por ticker (opcional) */}
+          <div style={{ marginTop: 8, padding: 14, background: C.panelLow, border: `1px dashed ${C.line}`, borderRadius: 8 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 10 }}>
+              <Icon name="sync" size={16} style={{ color: C.gold }} />
+              <span style={{ ...capsLabel, color: C.gold }}>Seguimiento automático (opcional)</span>
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+              <Field label="Ticker (Yahoo Finance)">
+                <input value={f.ticker} onChange={(e) => set("ticker", e.target.value.toUpperCase())} placeholder="Ej: AAPL, IWDA.L, SAN.MC" style={{ ...inp, ...mono }} />
+              </Field>
+              <Field label="Precio de compra">
+                <input type="number" value={f.precioCompra} onChange={(e) => set("precioCompra", e.target.value)} placeholder="0.00" style={{ ...inp, ...mono }} />
+              </Field>
+            </div>
+            <p style={{ margin: "8px 0 0", fontSize: 12, color: C.faint }}>
+              Si rellenas ticker y precio de compra, la rentabilidad se calculará sola al pulsar “Actualizar precios”. Si lo dejas vacío, se usa la rentabilidad que pongas a mano.
+            </p>
+          </div>
+
           <Field label="Fecha de entrada">
             <input type="date" value={f.fechaEntrada} onChange={(e) => set("fechaEntrada", e.target.value)} style={{ ...inp, ...mono }} />
           </Field>
